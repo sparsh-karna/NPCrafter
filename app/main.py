@@ -55,6 +55,17 @@ OPENAI_VOICES = {
     "sage": {"gender": "Female", "tone": "Calm, nurturing, insightful"},
     "shimmer": {"gender": "Female", "tone": "Airy, whimsical, radiant"}
 }
+PERSONA_LIST = [
+    {"name": "Barkel", "description": "Low-poly cartoon dog"},
+    {"name": "Boneguard", "description": "Armored undead skeleton warrior character"},
+    {"name": "Bricktee", "description": "Blocky toy figure with red shirt"},
+    {"name": "Drakblade", "description": "Armored dragon character holding a sword"},
+    {"name": "Gloam", "description": "Hooded robed figure with glowing eyes"},
+    {"name": "Pawvo", "description": "Cartoon dog character waving"},
+    {"name": "Plumeca", "description": "Cartoon Aztec child character with feathered headdress"},
+    {"name": "Popestep", "description": "Cartoon pope wearing sunglasses and sneakers"},
+    {"name": "Steelord", "description": "Cartoon armored knight with sword"}
+]
 
 # --- Simplified Models ---
 
@@ -141,6 +152,53 @@ class NPCResponse(BaseModel):
     dialogue: NPCDialogue
     visual_url: str = Field("", description="URL to the NPC visual")
     model_url: Optional[str] = Field(None, description="URL to the 3D model if available")
+
+# Helper function to select the best persona based on traits
+async def select_best_persona(traits: List[str], llm: ChatGroq) -> str:
+    """
+    Select the best persona from PERSONA_LIST based on NPC personality traits using Groq.
+    """
+    try:
+        prompt_template = ChatPromptTemplate.from_template("""
+        You are an expert RPG game designer tasked with selecting the most suitable persona for an NPC based on their personality traits.
+
+        NPC Personality Traits: {traits}
+
+        Available Personas:
+        {persona_list}
+
+        Instructions:
+        - Analyze the personality traits and match them to the persona descriptions.
+        - Choose the persona whose description best aligns with the given traits.
+        - Consider the visual and thematic elements implied by the traits (e.g., "mysterious" might suit a hooded figure, "noble" might suit a knight).
+        - Return only the name of the selected persona as a string.
+
+        Example Response:
+        Drakblade
+        """)
+
+        # Format persona list for the prompt
+        persona_list_str = "\n".join([f"- {persona['name']}: {persona['description']}" for persona in PERSONA_LIST])
+
+        chain = prompt_template | llm
+        result = await chain.ainvoke({
+            "traits": ", ".join(traits),
+            "persona_list": persona_list_str
+        })
+
+        # Extract the persona name from the response
+        selected_persona = result.content.strip()
+        
+        # Validate that the selected persona is in the allowed list
+        if selected_persona not in [persona["name"] for persona in PERSONA_LIST]:
+            print(f"Invalid persona '{selected_persona}' selected, defaulting to 'Drakblade'")
+            selected_persona = "Drakblade"  # Default fallback
+        
+        return selected_persona
+
+    except Exception as e:
+        print(f"Error selecting persona: {str(e)}")
+        return "Drakblade"  # Default fallback in case of error
 
 
 # Helper function to parse uploaded context file
@@ -1097,9 +1155,10 @@ async def create_persona(
         print(f"Error in create_persona: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error creating persona: {str(e)}")
 
+# Updated /npc/create-persona-langchain endpoint
 @app.post("/npc/create-persona-langchain", response_model=PersonaCreationResponse)
 async def create_persona_langchain(request: CreatePersonaLangchainRequest):
-    """Create an NPC persona using Langchain and Groq from natural language descriptions"""
+    """Create an NPC persona using Langchain and Groq from natural language descriptions, and select the best persona ID."""
     try:
         if not GROQ_API_KEY:
             raise HTTPException(
@@ -1119,7 +1178,7 @@ async def create_persona_langchain(request: CreatePersonaLangchainRequest):
         parser = JsonOutputParser(pydantic_object=PersonaCreationResponse)
         
         # Define the prompt template for persona creation
-        gender_instruction = f"Gender: {request.gender}\n" if request.gender else "Gender: Choose an appropriate gender based on the context (male, female, non-binary, or other).\n"
+        gender_instruction = f"Gender: {request.gender}\n" if hasattr(request, 'gender') and request.gender else "Gender: Choose an appropriate gender based on the context (male, female, non-binary, or other).\n"
         prompt_template = ChatPromptTemplate.from_template("""
         You are an expert RPG game designer and storyteller. 
         Your task is to create a detailed NPC persona based on the provided game context and NPC description.
@@ -1154,12 +1213,18 @@ async def create_persona_langchain(request: CreatePersonaLangchainRequest):
         )
         
         # Execute the chain with the user's input
-        result = chain.invoke({
+        result = await chain.ainvoke({
             "game_context": request.game_context,
             "npc_context": request.npc_context,
             "gender_instruction": gender_instruction,
             "format_instructions": parser.get_format_instructions()
         })
+        
+        # Select the best persona based on the generated personality traits
+        selected_persona = await select_best_persona(result["personality_traits"], llm)
+        
+        # Add the selected persona to the response
+        result["selected_persona"] = selected_persona
         
         return result
         

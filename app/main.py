@@ -58,15 +58,25 @@ OPENAI_VOICES = {
 
 # --- Simplified Models ---
 
+class PersonalityTrait(BaseModel):
+    trait: str = Field(..., description="Name of the personality trait")
+    intensity: float = Field(1.0, ge=0.0, le=1.0, description="Intensity of the trait (0.0 to 1.0)")
+    description: Optional[str] = Field(None, description="Optional free-text description of the trait")
+
 class CreatePersonaRequest(BaseModel):
-    """Request model for creating an NPC persona with voice"""
     npc_name: str = Field(..., description="Name of the NPC")
     game_context: str = Field(..., description="Game world context and setting")
+    stage_context: Optional[str] = Field(None, description="Stage or checkpoint description")
     npc_context: str = Field(..., description="NPC's role and position in the game world")
-    personality_traits: List[str] = Field(..., description="List of personality traits")
-    background: str = Field(..., description="Background story of the NPC")
+    personality_traits: List[Union[str, PersonalityTrait]] = Field(..., description="List of personality traits or structured traits with intensity")
+    dialogue_goal: str = Field(..., description="Dialogue goal (predefined or custom)")
+    background: Optional[str] = Field(None, description="Background story of the NPC (optional, will be generated if not provided)")
+    language: str = Field("English", description="Preferred language for dialogue")
     generate_voice_sample: bool = Field(True, description="Whether to generate a voice sample")
-    sample_text: str = Field(..., description="Sample text for voice generation")
+    sample_text: Optional[str] = Field(None, description="Sample text for voice generation")
+    context_file: Optional[UploadFile] = Field(None, description="Optional JSON/state file for in-game context")
+    intents: Optional[List[str]] = Field(default_factory=list, description="List of intents for response logic")
+    gender: str = Field(..., description="Gender of the NPC (male, female, non-binary, other)", pattern="^(male|female|non-binary|other)$")
 
 class CreatePersonaLangchainRequest(BaseModel):
     """Request model for creating an NPC persona using Langchain and Groq"""
@@ -96,16 +106,19 @@ class NPCTraits(BaseModel):
     backstory: str = Field("", description="Background story of the NPC")
     visual_style: str = Field("realistic", description="Visual style for the NPC")
     voice_style: Dict[str, str] = Field(default_factory=dict, description="Voice characteristics")
+    gender: str = Field(..., description="Gender of the NPC", pattern="^(male|female|non-binary|other)$")
 
 class PersonaCreationResponse(BaseModel):
-    """Structured response for persona creation using LLM"""
     npc_name: str = Field(..., description="Name of the NPC")
-    personality_traits: List[str] = Field(..., description="List of personality traits")
+    personality_traits: List[PersonalityTrait] = Field(..., description="Structured list of personality traits")
     dialogue_goal: str = Field(..., description="Purpose or goal of the NPC's dialogue")
     backstory: str = Field(..., description="Background story of the NPC")
     visual_style: str = Field(..., description="Visual style for the NPC")
     voice_style: Dict[str, str] = Field(..., description="Voice characteristics")
-    sample_dialogue: str = Field(..., description="Sample dialogue from the NPC")
+    sample_dialogue: List[str] = Field(..., description="List of sample dialogues from the NPC")
+    intents: List[str] = Field(..., description="Recognized intents for response logic")
+    memory_id: str = Field(..., description="ID for NPC memory tracking")
+    player_context: Dict[str, Any] = Field(default_factory=dict, description="Parsed player context from uploaded file")
 
 class NPCDialogue(BaseModel):
     """Model for NPC dialogue including text, emotion and audio"""
@@ -128,6 +141,145 @@ class NPCResponse(BaseModel):
     dialogue: NPCDialogue
     visual_url: str = Field("", description="URL to the NPC visual")
     model_url: Optional[str] = Field(None, description="URL to the 3D model if available")
+
+
+# Helper function to parse uploaded context file
+async def parse_context_file(file: UploadFile) -> Dict[str, Any]:
+    try:
+        content = await file.read()
+        if file.filename.endswith('.json'):
+            return json.loads(content.decode('utf-8'))
+        else:
+            return {"raw_content": content.decode('utf-8')}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error parsing context file: {str(e)}")
+
+# Helper function to generate backstory using Groq
+async def generate_backstory(npc_name: str, game_context: str, npc_context: str, personality_traits: List[Union[str, PersonalityTrait]], stage_context: Optional[str] = None) -> str:
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY not set")
+    
+    llm = ChatGroq(model_name="llama3-8b-8192", api_key=GROQ_API_KEY, temperature=0.7, max_tokens=512)
+    
+    # Format personality traits for prompt
+    traits = []
+    for trait in personality_traits:
+        if isinstance(trait, PersonalityTrait):
+            traits.append(f"{trait.trait} (intensity: {trait.intensity})")
+        else:
+            traits.append(trait)
+    
+    prompt_template = ChatPromptTemplate.from_template("""
+    You are an expert RPG game designer. Create a detailed backstory for an NPC based on the following:
+    
+    NPC Name: {npc_name}
+    Game Context: {game_context}
+    NPC Role: {npc_context}
+    Personality Traits: {traits}
+    Stage/Checkpoint: {stage_context}
+    
+    Generate a backstory (3-5 sentences) that:
+    1. Fits the game world's setting
+    2. Reflects the NPC's role and personality
+    3. Incorporates stage/checkpoint context if provided
+    4. Is engaging and immersive
+    
+    Return the backstory as plain text.
+    """)
+    
+    chain = prompt_template | llm
+    result = await chain.ainvoke({
+        "npc_name": npc_name,
+        "game_context": game_context,
+        "npc_context": npc_context,
+        "traits": ", ".join(traits),
+        "stage_context": stage_context or "Not specified"
+    })
+    
+    return result.content.strip()
+
+# Helper function to generate contextual dialogues
+async def generate_contextual_dialogues(npc_name: str, game_context: str, npc_context: str, personality_traits: List[Union[str, PersonalityTrait]], stage_context: Optional[str], player_context: Dict[str, Any], intents: List[str], language: str) -> List[str]:
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY not set")
+    
+    llm = ChatGroq(model_name="llama3-8b-8192", api_key=GROQ_API_KEY, temperature=0.75, max_tokens=512)
+    
+    # Format personality traits
+    traits = []
+    for trait in personality_traits:
+        if isinstance(trait, PersonalityTrait):
+            traits.append(f"{trait.trait} (intensity: {trait.intensity})")
+        else:
+            traits.append(trait)
+    
+    # Format player context
+    player_context_str = json.dumps(player_context, indent=2) if player_context else "No player context provided"
+    
+    prompt_template = ChatPromptTemplate.from_template("""
+    You are an NPC named {npc_name} in a game with the following details:
+    
+    Game Context: {game_context}
+    NPC Role: {npc_context}
+    Personality Traits: {traits}
+    Stage/Checkpoint: {stage_context}
+    Player Context: {player_context}
+    Intents: {intents}
+    Language: {language}
+    
+    Generate 3 sample dialogues that:
+    1. Reflect the NPC's personality and role
+    2. Are appropriate for the game world and stage
+    3. Incorporate player context if available
+    4. Align with the specified intents
+    5. Are in the specified language
+    6. Are 1-2 sentences each
+    
+    Return the dialogues as a JSON array of strings.
+    """)
+    
+    chain = prompt_template | llm | JsonOutputParser()
+    result = await chain.ainvoke({
+        "npc_name": npc_name,
+        "game_context": game_context,
+        "npc_context": npc_context,
+        "traits": ", ".join(traits),
+        "stage_context": stage_context or "Not specified",
+        "player_context": player_context_str,
+        "intents": ", ".join(intents) or "greeting, assistance, storytelling",
+        "language": language
+    })
+    
+    return result
+
+# Helper function to generate intents from context
+async def generate_intents(npc_context: str, game_context: str, player_context: Dict[str, Any]) -> List[str]:
+    if not GROQ_API_KEY:
+        return ["greeting", "assistance"]
+    
+    llm = ChatGroq(model_name="llama3-8b-8192", api_key=GROQ_API_KEY, temperature=0.7, max_tokens=256)
+    
+    player_context_str = json.dumps(player_context, indent=2) if player_context else "No player context provided"
+    
+    prompt_template = ChatPromptTemplate.from_template("""
+    Based on the following NPC and game context, identify 3-5 appropriate intents for the NPC's dialogue:
+    
+    Game Context: {game_context}
+    NPC Role: {npc_context}
+    Player Context: {player_context}
+    
+    Intents should be short phrases (e.g., "greeting", "quest-giving", "trading", "storytelling").
+    Return the intents as a JSON array of strings.
+    """)
+    
+    chain = prompt_template | llm | JsonOutputParser()
+    result = await chain.ainvoke({
+        "game_context": game_context,
+        "npc_context": npc_context,
+        "player_context": player_context_str
+    })
+    
+    return result
 
 # --- Endpoints ---
 
@@ -563,7 +715,7 @@ async def preview_dialogue(
         
         Also determine the most appropriate emotion for this response from: neutral, happy, concerned, curious, amused, thoughtful, stern, surprised, friendly, mysterious
         
-        Format your response as:
+        Format your response EXACTLY as follows, with no additional text, explanations, or notes:
         EMOTION: [selected emotion]
         DIALOGUE: [your response as the character]
         """)
@@ -599,25 +751,44 @@ async def preview_dialogue(
         
         # Parse the LLM response
         response_text = chain_result.content.strip()
-        
-        # Extract emotion and dialogue from response
-        emotion = "neutral"  # Default emotion
+
+        # Default values
+        emotion = "neutral"
         dialogue_text = response_text
-        
-        # Parse the structured response
+
+        valid_emotions = ["neutral", "happy", "concerned", "curious", "amused", "thoughtful", "stern", "surprised", "friendly", "mysterious"]
+        # Try to parse the structured response
         if "EMOTION:" in response_text and "DIALOGUE:" in response_text:
             try:
+                # Split into emotion and dialogue parts
                 parts = response_text.split("DIALOGUE:", 1)
                 emotion_part = parts[0].split("EMOTION:", 1)[1].strip().lower()
                 dialogue_text = parts[1].strip()
                 
-                # Validate emotion (use it if it's reasonable, otherwise stick with neutral)
-                valid_emotions = ["neutral", "happy", "concerned", "curious", "amused", "thoughtful", "stern", "surprised", "friendly", "mysterious"]
+                # Remove any trailing notes or extra content (e.g., "(Note: ...)") from dialogue_text
+                if "\n\n" in dialogue_text:
+                    dialogue_text = dialogue_text.split("\n\n")[0].strip()
+                
+                # Validate emotion
                 if emotion_part in valid_emotions:
                     emotion = emotion_part
-            except:
-                # If parsing fails, use the entire response as dialogue
-                dialogue_text = response_text
+                else:
+                    print(f"Invalid emotion '{emotion_part}' detected, defaulting to 'neutral'")
+            except Exception as e:
+                print(f"Error parsing response: {str(e)}")
+                # Fall back to treating the entire response as dialogue, but try to clean it up
+                dialogue_text = response_text.split("\n\n")[0].strip() if "\n\n" in response_text else response_text
+        else:
+            print("Response does not contain EMOTION and DIALOGUE markers, treating as dialogue")
+            # Try to clean up by removing any known prefix like "THOUGHTFUL:"
+            for valid_emotion in valid_emotions:
+                prefix = f"{valid_emotion.upper()}:"
+                if response_text.startswith(prefix):
+                    dialogue_text = response_text[len(prefix):].strip()
+                    emotion = valid_emotion.lower()
+                    break
+            # Remove any trailing notes
+            dialogue_text = dialogue_text.split("\n\n")[0].strip() if "\n\n" in dialogue_text else dialogue_text
         
         # Map emotion to tone for voice generation
         emotion_to_tone_mapping = {
@@ -761,96 +932,170 @@ async def get_npc(npc_id: str):
         model_url="https://dummy-model-url.com/npc-model.glb" if random.choice([True, False]) else None
     )
 
-@app.post("/npc/create-persona")
+@app.post("/npc/create-persona", response_model=PersonaCreationResponse)
 async def create_persona(
-    request: CreatePersonaRequest,
-    voice: str = Query(None, description="Optional override for the OpenAI voice to use")
+    request: CreatePersonaRequest = Body(...),
+    voice: str = Query(None, description="Optional override for the OpenAI voice to use"),
+    context_file: Optional[UploadFile] = File(None, description="Optional JSON/state file for in-game context")
 ):
-    """Create an NPC persona with voice sample using OpenAI TTS"""
+    """Create an NPC persona with voice sample and enhanced features using OpenAI TTS and Groq LLM"""
     try:
-        if not OPENAI_API_KEY and request.generate_voice_sample:
-            raise HTTPException(
-                status_code=500,
-                detail="OPENAI_API_KEY environment variable not set for voice generation"
+        if not GROQ_API_KEY:
+            raise HTTPException(status_code=500, detail="GROQ_API_KEY not set")
+        if request.generate_voice_sample and not OPENAI_API_KEY:
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set for voice generation")
+        
+        # Parse personality traits into structured format
+        personality_traits = []
+        for trait in request.personality_traits:
+            if isinstance(trait, str):
+                personality_traits.append(PersonalityTrait(trait=trait, intensity=1.0))
+            else:
+                personality_traits.append(trait)
+        
+        # Parse uploaded context file
+        player_context = {}
+        if context_file:
+            player_context = await parse_context_file(context_file)
+        elif request.context_file:
+            player_context = await parse_context_file(request.context_file)
+        
+        # Generate backstory if not provided
+        backstory = request.background
+        if not backstory:
+            backstory = await generate_backstory(
+                npc_name=request.npc_name,
+                game_context=request.game_context,
+                npc_context=request.npc_context,
+                personality_traits=personality_traits,
+                stage_context=request.stage_context
             )
         
-        # Create a mock persona response
-        persona_response = {
-            "npc_name": request.npc_name,
-            "game_context": request.game_context,
-            "personality_traits": request.personality_traits,
-            "background": request.background
+        # Generate or use provided intents
+        intents = request.intents
+        if not intents:
+            intents = await generate_intents(
+                npc_context=request.npc_context,
+                game_context=request.game_context,
+                player_context=player_context
+            )
+        
+        # Generate contextual dialogues
+        sample_dialogues = await generate_contextual_dialogues(
+            npc_name=request.npc_name,
+            game_context=request.game_context,
+            npc_context=request.npc_context,
+            personality_traits=personality_traits,
+            stage_context=request.stage_context,
+            player_context=player_context,
+            intents=intents,
+            language=request.language
+        )
+        
+        # Determine emotion based on personality traits
+        emotion = "neutral"
+        trait_names = [t.trait.lower() for t in personality_traits]
+        if any(t in ["cheerful", "happy", "optimistic"] for t in trait_names):
+            emotion = "happy"
+        elif any(t in ["wise", "thoughtful", "contemplative"] for t in trait_names):
+            emotion = "thoughtful"
+        elif any(t in ["mysterious", "enigmatic", "cryptic"] for t in trait_names):
+            emotion = "mysterious"
+        elif any(t in ["stern", "serious", "commanding"] for t in trait_names):
+            emotion = "stern"
+        
+        # Generate voice style
+        voice_style = {
+            "tone": emotion,
+            "accent": "neutral" if request.language.lower() == "english" else request.language.lower(),
+            "pace": "measured",
+            "gender": request.gender
         }
         
+        # Select visual style
+        visual_styles = ["realistic", "anime", "pixel-art", "comic"]
+        visual_style = random.choice(visual_styles)
+        
+        # Generate or use sample text for voice
+        sample_text = request.sample_text
+        if not sample_text and sample_dialogues:
+            sample_text = sample_dialogues[0]
+        
         # Generate voice sample if requested
-        if request.generate_voice_sample:
-            # Determine appropriate voice based on NPC traits
-            npc_traits = NPCTraits(
+        audio_url = ""
+        if request.generate_voice_sample and sample_text:
+            selected_voice = voice if voice else select_openai_voice(emotion, NPCTraits(
                 name=request.npc_name,
-                personality_traits=request.personality_traits,
-                dialogue_goal="",  # Not specified in this request
-                backstory=request.background
-            )
+                personality_traits=[t.trait for t in personality_traits],
+                dialogue_goal=request.dialogue_goal,
+                backstory=backstory,
+                voice_style=voice_style,
+                gender=request.gender
+            ))
             
-            # Infer emotion from personality traits
-            emotion = "neutral"
-            if any(trait.lower() in ["cheerful", "happy", "optimistic"] for trait in request.personality_traits):
-                emotion = "happy"
-            elif any(trait.lower() in ["wise", "thoughtful", "contemplative"] for trait in request.personality_traits):
-                emotion = "thoughtful"
-            elif any(trait.lower() in ["mysterious", "enigmatic", "cryptic"] for trait in request.personality_traits):
-                emotion = "mysterious"
-            elif any(trait.lower() in ["stern", "serious", "commanding"] for trait in request.personality_traits):
-                emotion = "stern"
-            
-            # Select voice if not provided
-            selected_voice = voice if voice else select_openai_voice(emotion, npc_traits)
-            
-            # Generate audio using OpenAI
             audio_content = generate_speech_with_openai(
-                text=request.sample_text,
+                text=sample_text,
                 voice=selected_voice,
                 emotion=emotion
             )
             
-            # Create a timestamp-based filename
             timestamp = int(datetime.now().timestamp())
             filename = f"{request.npc_name.replace(' ', '_')}_{timestamp}.mp3"
-            
-            # Create directory for audio files if it doesn't exist
             os.makedirs("audio_files", exist_ok=True)
-            
-            # Save the audio file
             file_path = os.path.join("audio_files", filename)
             with open(file_path, "wb") as f:
                 f.write(audio_content)
-                
-            # Add voice information to the response
-            persona_response["voice_info"] = {
-                "voice": selected_voice,
-                "emotion": emotion,
-                "audio_url": f"/audio/{filename}"
-            }
             
-            # Return the audio directly in response body
+            audio_url = f"/audio/{filename}"
+        
+        # Generate memory ID and store NPC data
+        memory_id = f"npc-{random.randint(1000, 9999)}"
+        NPC_MEMORY[memory_id] = {
+            "npc_name": request.npc_name,
+            "game_context": request.game_context,
+            "stage_context": request.stage_context,
+            "npc_context": request.npc_context,
+            "personality_traits": personality_traits,
+            "dialogue_goal": request.dialogue_goal,
+            "backstory": backstory,
+            "intents": intents,
+            "player_context": player_context,
+            "interactions": [],
+            "gender": request.gender
+        }
+        
+        # Create response
+        response = PersonaCreationResponse(
+            npc_name=request.npc_name,
+            personality_traits=personality_traits,
+            dialogue_goal=request.dialogue_goal,
+            backstory=backstory,
+            visual_style=visual_style,
+            voice_style=voice_style,
+            sample_dialogue=sample_dialogues,
+            intents=intents,
+            memory_id=memory_id,
+            player_context=player_context
+        )
+        
+        # If audio was generated, return it directly
+        if request.generate_voice_sample and audio_url:
+            with open(file_path, "rb") as f:
+                audio_content = f.read()
             return Response(
                 content=audio_content,
                 media_type="audio/mp3",
                 headers={
-                    "Content-Disposition": f'attachment; filename="{filename}"'
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "X-NPC-Metadata": json.dumps(response.dict())
                 }
             )
-        else:
-            # Return just the persona information without voice sample
-            return persona_response
         
+        return response
+    
     except Exception as e:
-        # Handle errors
         print(f"Error in create_persona: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error creating persona: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error creating persona: {str(e)}")
 
 @app.post("/npc/create-persona-langchain", response_model=PersonaCreationResponse)
 async def create_persona_langchain(request: CreatePersonaLangchainRequest):
@@ -864,7 +1109,7 @@ async def create_persona_langchain(request: CreatePersonaLangchainRequest):
         
         # Initialize the Groq LLM through Langchain
         llm = ChatGroq(
-            model_name="llama3-8b-8192",  # Using Llama3, can be changed to preferred model
+            model_name="llama3-8b-8192",
             api_key=GROQ_API_KEY,
             temperature=0.7,
             max_tokens=1024
@@ -874,6 +1119,7 @@ async def create_persona_langchain(request: CreatePersonaLangchainRequest):
         parser = JsonOutputParser(pydantic_object=PersonaCreationResponse)
         
         # Define the prompt template for persona creation
+        gender_instruction = f"Gender: {request.gender}\n" if request.gender else "Gender: Choose an appropriate gender based on the context (male, female, non-binary, or other).\n"
         prompt_template = ChatPromptTemplate.from_template("""
         You are an expert RPG game designer and storyteller. 
         Your task is to create a detailed NPC persona based on the provided game context and NPC description.
@@ -884,6 +1130,8 @@ async def create_persona_langchain(request: CreatePersonaLangchainRequest):
         NPC Description:
         {npc_context}
         
+        {gender_instruction}
+        
         Create a comprehensive NPC persona with the following details:
         1. A fitting name for the NPC
         2. 3-5 personality traits that define the character
@@ -892,6 +1140,7 @@ async def create_persona_langchain(request: CreatePersonaLangchainRequest):
         5. Visual style recommendation (realistic, anime, pixel art, or comic)
         6. Voice style characteristics including tone, accent, and pace
         7. A sample dialogue line this NPC might say
+        8. The NPC's gender (male, female, non-binary, or other)
         
         Provide your response as a JSON object with the following structure:
         {format_instructions}
@@ -908,13 +1157,13 @@ async def create_persona_langchain(request: CreatePersonaLangchainRequest):
         result = chain.invoke({
             "game_context": request.game_context,
             "npc_context": request.npc_context,
+            "gender_instruction": gender_instruction,
             "format_instructions": parser.get_format_instructions()
         })
         
         return result
         
     except Exception as e:
-        # Handle errors
         raise HTTPException(
             status_code=500,
             detail=f"Error creating persona with Langchain: {str(e)}"
@@ -984,7 +1233,6 @@ async def npc_speak(
             detail=f"Error generating speech: {str(e)}"
         )
 
-# Helper method to select the best OpenAI voice based on emotion/tone
 def select_openai_voice(emotion: str, npc_traits: NPCTraits = None):
     """
     Select the most appropriate OpenAI voice based on emotion and NPC traits
@@ -1012,14 +1260,24 @@ def select_openai_voice(emotion: str, npc_traits: NPCTraits = None):
     
     # If NPC traits are provided, use them to refine the selection
     if npc_traits:
-        # Consider gender preference if specified in voice_style
-        if npc_traits.voice_style and "gender" in npc_traits.voice_style:
-            gender_pref = npc_traits.voice_style["gender"].lower()
-            filtered_voices = []
-            
+        filtered_voices = []
+        gender_pref = npc_traits.gender.lower() if npc_traits.gender else None
+        
+        if gender_pref:
             for voice in voice_options:
                 voice_gender = OPENAI_VOICES[voice]["gender"].lower()
-                if gender_pref in voice_gender:
+                # Match gender, accounting for partial matches (e.g., "male (androgynous)" matches "male")
+                if gender_pref in voice_gender or (gender_pref == "non-binary" and "gender-fluid" in voice_gender):
+                    filtered_voices.append(voice)
+            
+            if filtered_voices:
+                voice_options = filtered_voices
+        # Consider voice_style if no specific gender match
+        elif npc_traits.voice_style and "gender" in npc_traits.voice_style:
+            gender_pref = npc_traits.voice_style["gender"].lower()
+            for voice in voice_options:
+                voice_gender = OPENAI_VOICES[voice]["gender"].lower()
+                if gender_pref in voice_gender or (gender_pref == "non-binary" and "gender-fluid" in voice_gender):
                     filtered_voices.append(voice)
             
             if filtered_voices:

@@ -750,6 +750,19 @@ async def preview_dialogue(
                 achievements = ', '.join(player_stats.achievements[:2])
                 player_context_parts.append(f"The player has earned achievements: {achievements}")
         
+        # Validate and initialize history
+        MAX_HISTORY_LENGTH = 20
+        if history and any(not isinstance(msg, str) for msg in history):
+            raise HTTPException(status_code=400, detail="History must contain only strings")
+        if history and len(history) > MAX_HISTORY_LENGTH:
+            raise HTTPException(status_code=400, detail=f"History exceeds maximum length of {MAX_HISTORY_LENGTH}")
+        
+        updated_history = history.copy() if history is not None else []
+        history_str = (
+            "\n".join([f"{'Player' if i % 2 == 0 else 'NPC'}: {msg}" for i, msg in enumerate(history)])
+            if history else "No prior conversation."
+        )
+        
         # Create the prompt template for dialogue generation
         prompt_template = ChatPromptTemplate.from_template("""
         You are roleplaying as an NPC in a game with the following characteristics:
@@ -772,8 +785,6 @@ async def preview_dialogue(
         3. Is 2-4 sentences long
         4. Sounds natural and engaging
         5. Advances the conversation or provides value to the player
-        
-        Also determine the most appropriate emotion for this response from: neutral, happy, concerned, curious, amused, thoughtful, stern, surprised, friendly, mysterious
         
         Format your response EXACTLY as follows, with no additional text, explanations, or notes:
         EMOTION: [selected emotion]
@@ -805,6 +816,7 @@ async def preview_dialogue(
             goal=npc_traits.dialogue_goal,
             backstory=npc_traits.backstory if npc_traits.backstory else "A character with a mysterious past.",
             voice_style=voice_style,
+            history=history_str,
             player_context=player_context,
             interaction_prompt=interaction_prompt
         ))
@@ -912,7 +924,10 @@ async def preview_dialogue(
             audio_content=audio_content
         )
 
-        history.append(dialogue_text.text)
+        # Append new dialogue to history
+        updated_history.append(dialogue.text)
+        if len(updated_history) > MAX_HISTORY_LENGTH:
+            updated_history = updated_history[-MAX_HISTORY_LENGTH:]
         
         # Prepare the response data
         dialogue_dict = dialogue.dict()
@@ -925,7 +940,7 @@ async def preview_dialogue(
             "context_used": len(context_refs) > 0,
             "audio_generation_status": "success" if audio_generation_success else "failed",
             "message": "Dialogue and audio generated successfully" if audio_generation_success else "Dialogue generated successfully, but audio generation failed",
-            "history": history
+            "history": updated_history
         }
         
         # If audio was generated successfully, include it in the response

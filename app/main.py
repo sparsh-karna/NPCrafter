@@ -690,7 +690,8 @@ async def create_random_npc(
 async def preview_dialogue(
     npc_traits: NPCTraits = Body(..., description="NPC traits to base dialogue on"),
     message: str = Body(None, embed=True, description="Optional player message to respond to"),
-    player_stats: Optional[PlayerStats] = Body(None, embed=True, description="Optional player stats for context")
+    player_stats: Optional[PlayerStats] = Body(None, embed=True, description="Optional player stats for context"),
+    history: Optional[List[str]] = Body(None, embed=True, description="Optional dialogue history for context")
 ):
     """Generate a preview of NPC dialogue based on NPC traits and optional player input using Groq API"""
     
@@ -758,6 +759,7 @@ async def preview_dialogue(
         Dialogue Goal: {goal}
         Backstory: {backstory}
         Voice Style: {voice_style}
+        History: {history}
         
         Context Information:
         {player_context}
@@ -909,6 +911,8 @@ async def preview_dialogue(
             audio_url=audio_url,
             audio_content=audio_content
         )
+
+        history.append(dialogue_text.text)
         
         # Prepare the response data
         dialogue_dict = dialogue.dict()
@@ -920,7 +924,8 @@ async def preview_dialogue(
             "llm_model": "llama3-8b-8192",
             "context_used": len(context_refs) > 0,
             "audio_generation_status": "success" if audio_generation_success else "failed",
-            "message": "Dialogue and audio generated successfully" if audio_generation_success else "Dialogue generated successfully, but audio generation failed"
+            "message": "Dialogue and audio generated successfully" if audio_generation_success else "Dialogue generated successfully, but audio generation failed",
+            "history": history
         }
         
         # If audio was generated successfully, include it in the response
